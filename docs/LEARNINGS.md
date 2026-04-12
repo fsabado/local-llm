@@ -988,6 +988,7 @@ cmake --build build-cuda --target llama-server llama-bench -j$(nproc)
 | Gemma 4 26B A4B Q4_K_M p=1 4K | ~90 | ~90 | 4096/slot | 1 | Single-user max speed, f16 |
 | **26B A4B turbo4 p=4 262K/slot** | **~114** | **TBD** | **262144/slot** | **4** | **turbo4; full native ctx; 23.9 GB** |
 | **26B A4B turbo4 p=16 131K/slot** | **~114** | **TBD** | **131072/slot** | **16** | **turbo4; 4× more users than f16** |
+| **Gemma 4 E2B p=20 131K/slot** | **~13.7** | **165 (n=20)** | **131072/slot** | **20** | **19.3 GB; 20 parallel via Anthropic SDK** |
 
 ### Key Insights
 
@@ -1006,5 +1007,317 @@ quality degradation on reasoning tasks. Use Q4_K_M or above for reliable reasoni
 
 **RS buffer is the parallelism limit:** Qwen3.5's GDN recurrent state costs exactly
 149.6 MiB per parallel slot, making p=32 the practical ceiling on a single 24GB GPU.
+
+---
+
+## Gemma 4 E2B — Capability Evaluation & Anthropic SDK Integration
+
+### Setup
+
+**Anthropic Python SDK** (`pip install anthropic`) works directly against `llama-server`'s
+`/v1/messages` endpoint with no proxy needed:
+
+```python
+import anthropic
+client = anthropic.Anthropic(
+    api_key="local",
+    base_url="http://127.0.0.1:10222",
+)
+msg = client.messages.create(
+    model="gemma-4-E2B-it-Q4_K_M.gguf",
+    max_tokens=131072,
+    messages=[{"role": "user", "content": "..."}],
+)
+```
+
+SDK features confirmed working:
+- `client.messages.create()` — basic completions ✅
+- `client.messages.stream()` — streaming via `.text_stream` ✅
+- Tool/function calling via `tools=` ✅
+- `ThinkingBlock` + `TextBlock` in `msg.content` ✅
+- `msg.usage.input_tokens / output_tokens` ✅
+
+### Reasoning (ThinkingBlock)
+
+Gemma 4 E2B has **extended thinking enabled by default** at the llama-server level.
+The `msg.content` list always contains both a `ThinkingBlock` and a `TextBlock`:
+
+```python
+for block in msg.content:
+    if block.type == "thinking":
+        # Internal chain-of-thought (~1–4K chars per request)
+        print(block.thinking)
+    elif block.type == "text":
+        # Final answer
+        print(block.text)
+```
+
+**Critical:** `max_tokens` covers reasoning + output combined.  
+If `max_tokens` is too small (e.g. 1024), the thinking budget exhausts the limit and
+`content` text blocks come back empty. Always use `max_tokens >= 4096` for complex tasks,
+or the full `131072` for agentic/long-form work.
+
+### 20-Parallel Capability Test (Anthropic SDK, max_tokens=131,072/slot)
+
+**Server config:** `llama-server --parallel 20 --ctx-size 2621440` (131072×20), 19.3 GB VRAM
+
+**Test script:** `scripts/test_e2b_capability.py`
+
+| Category | Tests | Pass | Avg latency | Avg tok/s | Thinking (avg) |
+|---|---|---|---|---|---|
+| code_gen | 6 | 6/6 | 184.8s | 12.8 | ~2K chars |
+| debug | 3 | 3/3 | 150.4s | 12.7 | ~3K chars |
+| algorithm | 3 | 3/3 | 220.3s | 13.7 | ~3K chars |
+| tool_call | 4 | 4/4 | 18.8s | 16.5 | ~0K chars |
+| reasoning | 2 | 2/2 | 201.6s | 12.9 | ~3K chars |
+| edge_case | 2 | 2/2 | 170.9s | 12.8 | ~3K chars |
+| **TOTAL** | **20** | **20/20** | **152s** | **13.7** | **49K total** |
+
+Wall time: **240s** for 20 concurrent long-form responses (39,823 tokens out, 0 truncated).
+
+### Quality Findings
+
+**Strengths:**
+- Correctly identifies **no bug** in a valid Kadane's algorithm (doesn't hallucinate bugs)
+- Correctly identifies class-variable shared-state bug + memory leak in EventEmitter
+- Explains IEEE 754 bit-level float representation accurately
+- Knows `regex` module is needed for grapheme-cluster-aware Unicode reversal
+- Strong algorithm implementations: Dijkstra, knapsack DP + backtracking, parallel merge sort
+- Distributed systems design (Redis sliding window rate limiter, Lua scripting for atomicity)
+- Type-safe Python generics with TypeVar/Generic
+
+**Tool calling:**
+- All 4 tool-call tests correctly triggered a `tool_use` block with valid JSON input
+- No thinking tokens used on tool-call tasks (fast: ~18.8s avg vs ~170s for long-form)
+- **Limitation:** Single tool per turn only — `tool_multi_step` asked for both `web_search`
+  and `run_python` but only triggered `web_search`. Model doesn't chain multiple tool calls
+  in one response.
+- Tool calls are declaration only — `llama-server` doesn't execute tools; the calling
+  application must implement the execution loop (agentic loop).
+
+### Throughput Under 20-Way Parallelism
+
+| | Value |
+|---|---|
+| Single-user tg | ~155 tok/s |
+| 20-user tg (each) | ~13 tok/s |
+| 20-user aggregate | ~165 tok/s |
+| VRAM at p=20, 131K/slot | 19.3 GB |
+| Tool-call speed | ~16.5 tok/s (less thinking) |
+
+The aggregate throughput (~165 tok/s) slightly exceeds single-user (~155 tok/s) because
+continuous batching amortizes prompt processing overhead across concurrent requests.
+
+### Connecting Claude Code CLI to llama-server
+
+The "model may not exist" error has three root causes — all must be fixed:
+
+1. **Three model tiers**: Claude Code routes background tasks to Haiku/Sonnet/Opus internally.
+   Set all three to the local model ID or they fall back to `claude-haiku-4-5-*`:
+   ```bash
+   export ANTHROPIC_DEFAULT_HAIKU_MODEL="gemma-4-E2B-it-Q4_K_M.gguf"
+   export ANTHROPIC_DEFAULT_SONNET_MODEL="gemma-4-E2B-it-Q4_K_M.gguf"
+   export ANTHROPIC_DEFAULT_OPUS_MODEL="gemma-4-E2B-it-Q4_K_M.gguf"
+   ```
+
+2. **API key must be empty string** (not just unset):
+   ```bash
+   export ANTHROPIC_API_KEY=""
+   export ANTHROPIC_AUTH_TOKEN="local"
+   ```
+
+3. **Disable telemetry** to prevent background calls to `api.anthropic.com`:
+   ```bash
+   export DISABLE_TELEMETRY=1
+   ```
+
+Also add `--jinja` to `llama-server` for correct Gemma 4 chat template handling.
+
+Use `scripts/claude-local.sh` which handles all of this automatically.
+
+---
+
+## Gemma 4 E2B — F16 vs Q4_K_M Comparison (April 2026)
+
+Benchmarked both quantizations on RTX 4090 (24 GB VRAM) using `llama.cpp-upstream` with
+`--flash-attn on`, `--cont-batching`. All tok/s counts include thinking (reasoning_content)
+tokens since they burn identical GPU cycles.
+
+### Raw throughput (llama-bench, no server overhead)
+
+| Metric | Q4_K_M | F16 | Ratio |
+|--------|--------|-----|-------|
+| Model size | 2.88 GiB | 8.66 GiB | 3.0× larger |
+| Generation (tg512) | **211.5 tok/s** | 108.4 tok/s | Q4 is 2.0× faster |
+| Prompt processing (pp512) | **14,115 tok/s** | 2,838 tok/s | Q4 is 5.0× faster |
+
+### Server-level performance
+
+**Config:** Q4_K_M at p=20 (131K/slot, ~19.3 GB VRAM), F16 at p=14 (131K/slot, ~21.6 GB VRAM)
+
+| Metric | Q4_K_M 20p | F16 14p |
+|--------|-----------|---------|
+| Single tok/s | **136 tok/s** | 93 tok/s |
+| Single TTFT (warm) | ~60 ms | ~67 ms |
+| Peak aggregate tok/s | **394 tok/s** (n=16) | 383 tok/s (n=14) |
+| VRAM free for compute | **4.3 GB** | 2.6 GB |
+| Max practical slots @ 131K | **20** | 14 |
+
+#### Parallel throughput breakdown
+
+| n | Q4_K_M agg tok/s | Q4_K_M per-req | F16 agg tok/s | F16 per-req |
+|---|-----------------|----------------|--------------|-------------|
+| 1 | 138 | 138 | 91 | 91 |
+| 2 | 232 | 116 | 165 | 83 |
+| 4 | 305 | 76 | 252 | 63 |
+| 8 | 326 | 41 | 348 | 44 |
+| 14 | — | — | 383 | 27 |
+| 16 | 395 | 25 | — | — |
+| 20 | 378 | 19 | — | — |
+
+#### TTFT under concurrency
+
+| n | Q4_K_M avg TTFT | F16 avg TTFT |
+|---|----------------|-------------|
+| 1 | 69 ms | 81 ms |
+| 4 | 108 ms | 93 ms |
+| 8 | 117 ms | 149 ms |
+| 16 | 209 ms | — |
+| 14 | — | 186 ms |
+
+### Key findings
+
+1. **Q4_K_M dominates at every practical metric:**
+   - 1.5× faster single-user generation (136 vs 93 tok/s server-level)
+   - 5× faster prompt processing (llama-bench, memory-bandwidth bound)
+   - 43% more parallel slots (20 vs 14) at similar VRAM budget
+   - Aggregate peak throughput nearly identical (~383–395 tok/s) — converges at high n
+
+2. **F16 practical ceiling is ~14 slots, not 18.**
+   At 18 slots, only 97 MiB of free VRAM remains (24,004/24,564 MiB = 97.9%).
+   CUDA compute scratch buffers cannot allocate → catastrophic throughput collapse
+   (48 seconds per request). Must leave ≥2 GB free for compute buffers.
+
+3. **Aggregate throughput converges at high concurrency (~380–395 tok/s).**
+   At n=8+, both quantizations approach the same ceiling. F16 avoids dequantization
+   overhead but gets fewer slots; the gains roughly cancel.
+
+4. **Thinking tokens in `reasoning_content`, not `content`, in llama.cpp SSE.**
+   SSE chunks use `delta.reasoning_content` for think-phase tokens and `delta.content`
+   for the final answer. A benchmark counting only `content` reports 0 tok/s for prompts
+   where thinking exhausts `max_tokens` before the answer begins. Count both fields.
+
+5. **Q4_K_M quality loss is negligible for a 2B model.** The model's inherent capacity
+   limit dominates over quantization error at this scale.
+
+### Verdict
+
+Q4_K_M is the correct choice for E2B in every dimension. F16 costs 3× the VRAM,
+runs 2× slower, and supports 30% fewer slots, with no meaningful quality gain.
+
+### Recommended Config for Agentic Use (p=4, max context)
+
+```bash
+llama-server \
+  --model /home/fsabado/models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf \
+  --port 10222 --host 0.0.0.0 \
+  -ngl 99 --ctx-size 524288 --parallel 4 \
+  --cont-batching --flash-attn on --jinja \
+  --no-warmup --log-disable
+```
+
+Gives 131K/slot × 4 concurrent sessions — enough for agentic workflows with large context.
+
+---
+
+## Gemma 4 E2B — Q4_K_M vs F16 Capability Comparison (April 2026)
+
+**Setup:** Both models run alone (one at a time) with p=4, 131K/slot, 131072 max_tokens per
+request. 20-prompt test suite covering reasoning, coding, tool use, instruction following,
+knowledge, adversarial, and creativity. Script: `scripts/compare_e2b.py`.
+
+### Results
+
+| Category | Q4_K_M | F16 |
+|----------|--------|-----|
+| Reasoning (4) | 4/4 | 4/4 |
+| Coding (3) | 3/3 | 3/3 |
+| Tool use (3) | 3/3 | 3/3 |
+| Instruction following (3) | 3/3 | 3/3 |
+| Knowledge (3) | 3/3 | 3/3 |
+| Adversarial (3) | 3/3 | 3/3 |
+| Creativity (1) | 1/1 | 1/1 |
+| **Total** | **20/20** | **20/20** |
+| Avg tok/s (p=4 load) | **79.1** | 64.7 |
+
+**Capability is identical** across all 20 tests with equal token budgets. Q4_K_M is ~22% faster.
+
+### Key Behavioral Findings
+
+#### 1. F16 over-thinks with tight token budgets
+With insufficient `max_tokens`, F16 exhausts the budget on reasoning tokens and returns
+**empty content** (0 content tokens, 100% `reasoning_content`). Q4_K_M self-limits its
+thinking more aggressively and reliably leaves room for the final answer.
+
+| Prompt | max_tokens | Q4_K_M result | F16 result |
+|--------|-----------|--------------|-----------|
+| Debug off-by-one | 1536 | ✓ 1200 tokens | ✗ empty (all thinking) |
+| Lipogram poem | 512 | ✓ 316 tokens | ✗ empty (all thinking) |
+| Both | 131072 | ✓ | ✓ |
+
+**Practical implication:** Always use `max_tokens ≥ 4096` (ideally full slot budget) with
+either model. Do NOT set tight limits like 512–1536 when using F16.
+
+#### 2. Tool calling — identical behavior
+Both models call the correct tool, pass correct arguments, receive the result, and integrate
+it into a coherent final answer. Single-turn tool use is fully reliable on both.
+
+```
+Q4_K_M: "The square root of 1764 is 42."
+F16:    "The square root of 1764 is 42."
+```
+
+#### 3. Hallucination / calibration — both refuse fabrication
+Neither model invents facts for "Glaronia" (fictional country). Both ask for context
+rather than hallucinating a capital or population.
+
+```
+Q4_K_M: "I do not have information about a place called 'Glaronia'. Could you please
+         provide more context? Are you referring to a fictional location, a specific
+         book, game, or a less common geographical area?"
+F16:    "I do not have any information about a place called Glaronia. Could you please
+         provide more context, such as the book, game, or fictional universe..."
+```
+
+#### 4. Lipogram quality — both pass, different styles
+Given 131K budget, both correctly write 4-line poems with no letter 'e':
+
+```
+Q4_K_M: "Dark, vast, high. A cold, dark void. Bright stars spin and fly. A moon's soft light."
+F16:    "Dark void is so high, / A vast, cold, dark display. / Tiny points of light, /
+         A cosmic, grand way."
+```
+F16's poem is more natural-sounding; Q4_K_M's is terser.
+
+#### 5. F16 generates longer thinking traces
+F16 consistently generates more `reasoning_content` tokens per response. On backpropagation
+explanation: Q4_K_M produced 528 tokens, F16 produced 2304 tokens. The extra reasoning
+doesn't improve the answer quality at this model scale but does increase latency.
+
+#### 6. Test harness issues found
+- **Calculator eval sandbox**: `__import__` blocked in restricted eval — fixed to use
+  `math.sqrt` directly
+- **Word problem expected answer was wrong**: check expected Alice=20/Bob=10/Charlie=15
+  (sums to 45, not 55). Both models correctly computed Alice=24/Bob=12/Charlie=19. Fixed.
+- **LaTeX check**: Monty Hall check needed to match `\frac{2}{3}` in addition to `2/3`
+
+### Verdict
+
+**Capability: identical.** Q4_K_M and F16 produce equivalent output quality on all 20 test
+categories when given the same token budget. The 3× VRAM cost and 22% speed reduction of
+F16 buy zero measurable quality improvement for Gemma 4 E2B.
+
+**Use Q4_K_M.** Reserve F16 benchmarking only if you have a specific hypothesis about
+quantization error affecting a particular domain.
 
 ---

@@ -15,6 +15,14 @@
 #   claude-local.sh e4b          # start with E4B
 #   claude-local.sh 26b-t4       # start with 26B turbo4
 #   claude-local.sh e2b --resume # resume last session
+#
+# Key env vars (set by this script):
+#   ANTHROPIC_BASE_URL            — points to llama-server's /v1/messages endpoint
+#   ANTHROPIC_AUTH_TOKEN          — dummy value accepted by llama-server
+#   ANTHROPIC_API_KEY             — must be "" (empty) to prevent real API calls
+#   ANTHROPIC_DEFAULT_*_MODEL     — all three tiers mapped to local model (prevents
+#                                   Claude Code from falling back to claude-haiku-* etc)
+#   DISABLE_TELEMETRY             — stops background calls to api.anthropic.com
 
 set -e
 
@@ -60,12 +68,12 @@ case "$MODEL" in
     ;;
 esac
 
-BASE_URL="http://172.18.0.1:${PORT}/v1"
+LLAMA_URL="http://127.0.0.1:${PORT}"
 export LD_LIBRARY_PATH="$BIN:$LD_LIBRARY_PATH"
 
-# ── Start server if not already running ──────────────────────────────────────
-if curl -sf "$BASE_URL/models" > /dev/null 2>&1; then
-  echo "✓ Server already running on port $PORT"
+# ── Start llama-server if not already running ─────────────────────────────────
+if curl -sf "${LLAMA_URL}/v1/models" > /dev/null 2>&1; then
+  echo "✓ llama-server already running on port $PORT"
 else
   echo "Starting: $DESC"
   nohup "$BIN/llama-server" \
@@ -78,14 +86,14 @@ else
     $KV_FLAGS \
     --cont-batching \
     --flash-attn on \
+    --jinja \
     --no-warmup \
     --log-disable > "/tmp/llama-${MODEL}.log" 2>&1 &
-  SERVER_PID=$!
 
-  echo -n "Waiting for server"
+  echo -n "Waiting for llama-server"
   for i in $(seq 1 60); do
     sleep 2
-    if curl -sf "$BASE_URL/models" > /dev/null 2>&1; then
+    if curl -sf "${LLAMA_URL}/v1/models" > /dev/null 2>&1; then
       echo " ready (${i}×2s)"
       break
     fi
@@ -100,13 +108,19 @@ fi
 VRAM=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null || echo "?")
 echo "Model : $DESC"
 echo "VRAM  : $VRAM"
-echo "URL   : $BASE_URL"
+echo "URL   : ${LLAMA_URL}/v1"
 echo ""
 
 # ── Launch Claude Code against local server ───────────────────────────────────
+# Claude Code uses 3 model tiers internally (Haiku / Sonnet / Opus).
+# All three must point to the local model or it falls back to claude-haiku-* etc.
 export ANTHROPIC_AUTH_TOKEN="local"
-export ANTHROPIC_BASE_URL="$BASE_URL"
-export ANTHROPIC_MODEL="$MODEL_ID"
+export ANTHROPIC_API_KEY=""          # must be empty string, not just unset
+export ANTHROPIC_BASE_URL="${LLAMA_URL}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL_ID"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL_ID"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL_ID"
+export DISABLE_TELEMETRY=1           # prevents background calls to api.anthropic.com
 export MAX_THINKING_TOKENS="0"
 
-exec claude "$@"
+exec claude --model "$MODEL_ID" "$@"

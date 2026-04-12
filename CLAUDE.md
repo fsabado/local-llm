@@ -14,8 +14,8 @@ Personal workspace for running, benchmarking, and optimizing LLMs locally on an 
 | Inference (Gemma 4 turbo4 KV) | llama-cpp-turboquant-gemma4 (`~/src/llama-cpp-turboquant-gemma4/build-cuda/bin`) |
 | Inference (vLLM) | `.venv/` — shared Python env, activate with `source .venv/bin/activate` |
 
-> **WSL2 note:** loopback (`127.0.0.1`) TCP is blocked inside the Claude Code sandbox.
-> Always use the WSL2 bridge IP `172.18.0.1` when connecting to local servers.
+> **WSL2 note:** `127.0.0.1` works fine from the host shell. Inside the Claude Code sandbox
+> loopback may be restricted — use the WSL2 bridge IP `172.18.0.1` from within sandbox tool calls.
 
 ---
 
@@ -30,9 +30,12 @@ local-llm/
 │
 ├── scripts/
 │   ├── bench.py                ← API-level benchmark (TPS, parallel, reasoning quality)
+│   ├── bench_e2b.py            ← E2B benchmark: TTFT, tok/s, parallel throughput (both quants)
 │   ├── run_bench.py            ← automated: start llama-server → bench → kill server
 │   ├── test.py                 ← quick smoke test for any running vLLM/llama.cpp server
 │   ├── setup.sh                ← one-time vLLM venv setup (CUDA 13, nightly)
+│   ├── claude-local.sh         ← launch Claude Code CLI against local Gemma model
+│   ├── test_e2b_capability.py  ← 20-parallel capability test via Anthropic SDK
 │   └── lm_eval_tasks/
 │       └── arc_challenge_gen.yaml  ← custom lm-eval task (ARC-Challenge, generate_until)
 │
@@ -40,7 +43,9 @@ local-llm/
 ├── logs/                       ← server log files (gitignored)
 │
 ├── gemma4-e2b/
-│   └── start.sh                ← Gemma 4 E2B Q4_K_M via upstream llama.cpp, port 10222
+│   ├── start.sh                ← Gemma 4 E2B Q4_K_M via upstream llama.cpp, port 10222
+│   ├── launch.py               ← configurable launcher: named flags + presets + idempotent
+│   └── gemma-e2b-20p.sh        ← preset: 20 slots × 131K (agentic sweet spot, ~19.3 GB)
 │
 ├── gemma4-e4b/
 │   └── start.sh                ← Gemma 4 E4B Q4_K_M via upstream llama.cpp, port 10333
@@ -67,7 +72,8 @@ local-llm/
 | Qwen3.5-27B Q4_K_M (llama.cpp) | `qwen35-27b-gguf/` | llama-turboquant-animehacker | 10111 | ~15 GB | 40 |
 | Gemma 4 E4B (vLLM) | `gemma4-e4b/` | vLLM | 8001 | ~8 GB | — |
 | Gemma 4 E4B Q4_K_M (llama.cpp) | `gemma4-e4b/` | upstream llama.cpp | 10333 | ~10–23 GB | 100–105 |
-| Gemma 4 E2B Q4_K_M (llama.cpp) | `gemma4-e2b/` | upstream llama.cpp | 10222 | ~6–18 GB | 155–167 |
+| Gemma 4 E2B Q4_K_M (llama.cpp) | `gemma4-e2b/` | upstream llama.cpp | 10222 | ~6–19 GB | 136–211 |
+| Gemma 4 E2B F16 (llama.cpp) | `gemma4-e2b/` | upstream llama.cpp | 10222 | ~21.6 GB | 93 (p=14 max) |
 | Gemma 4 26B A4B Q4_K_M (llama.cpp) | `gemma4-26b-a4b/` | upstream llama.cpp | 10444 | ~22–24 GB | 83–90 |
 
 > Only one model at a time on a single 24 GB GPU (except Gemma 4 E2B/E4B, which leave headroom).
@@ -89,11 +95,20 @@ bash start.sh /home/fsabado/models/gemma-4-e4b-it/google_gemma-4-E4B-it-Q4_K_M.g
 bash start.sh /home/fsabado/models/gemma-4-e4b-it/google_gemma-4-E4B-it-Q4_K_M.gguf 10333 131072 64
 ```
 
-### Gemma 4 E2B (fastest — 160 tok/s, low VRAM, 131K context)
+### Gemma 4 E2B (fastest, lowest VRAM, 131K context)
 
 ```bash
-# Default: 16 parallel slots, 131K context per slot (~18 GB VRAM)
-cd gemma4-e2b && bash start.sh
+# Recommended: 20 slots × 131K — agentic sweet spot (~19.3 GB VRAM, 136 tok/s, 394 tok/s peak)
+bash gemma4-e2b/gemma-e2b-20p.sh
+# or with named flags / presets:
+python3 gemma4-e2b/launch.py                    # default = 20p preset
+python3 gemma4-e2b/launch.py --preset 20p
+python3 gemma4-e2b/launch.py --list-presets     # see all presets
+python3 gemma4-e2b/launch.py --restart          # kill existing + relaunch
+
+# Manual via start.sh positional args:
+#   start.sh [model] [port] [total_ctx] [parallel]
+cd gemma4-e2b && bash start.sh                  # default: 16p × 131K/slot
 
 # Max full-context parallelism — 40 slots at 131K/slot (~24 GB, iSWA ceiling)
 bash start.sh /home/fsabado/models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf 10222 5242880 40
@@ -139,14 +154,85 @@ cd qwen35-27b && bash start.sh
 # Smoke test — check a running server (pass port as arg)
 python3 scripts/test.py 10222
 
+# E2B benchmark — TTFT, tok/s, parallel throughput (works with any llama.cpp server)
+python3 scripts/bench_e2b.py 10222 --label "Q4_K_M 20p"
+python3 scripts/bench_e2b.py 10222 --parallel-levels 1 2 4 8 16 20
+
 # Full API benchmark (TPS, parallel throughput, reasoning quality)
 python3 scripts/bench.py 10222
 
 # Automated: start server → benchmark → kill (Qwen3.5-27B GGUF variants)
 python3 scripts/run_bench.py [model_filename.gguf]
+
+# Capability test — 20 parallel requests via Anthropic SDK (code gen, debug, tools, reasoning)
+.venv/bin/python3 scripts/test_e2b_capability.py
 ```
 
 Benchmark results go in `results/`. Server logs go in `logs/`.
+
+---
+
+## Claude Code + Local LLM (Gemma 4 E2B)
+
+Use `scripts/claude-local.sh` to launch the Claude Code CLI against any local Gemma model.
+It starts `llama-server` if not running and sets all required env vars.
+
+```bash
+# Start with Gemma 4 E2B (default, ~6.6 GB VRAM, p=4, 131K/slot)
+bash scripts/claude-local.sh
+
+# Other models
+bash scripts/claude-local.sh e4b          # Gemma 4 E4B
+bash scripts/claude-local.sh 26b          # Gemma 4 26B A4B (f16 KV)
+bash scripts/claude-local.sh 26b-t4       # Gemma 4 26B A4B (turbo4 KV)
+bash scripts/claude-local.sh e2b --resume # Resume last session
+```
+
+**Required env vars** (set automatically by the script):
+
+| Variable | Value | Why |
+|---|---|---|
+| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:<port>` | Points Claude Code at local server |
+| `ANTHROPIC_API_KEY` | `""` (empty string) | Must be explicitly empty — unset causes fallback to Anthropic API |
+| `ANTHROPIC_AUTH_TOKEN` | `"local"` | Dummy token accepted by llama-server |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | model filename | Prevents fallback to `claude-haiku-4-5-*` |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | model filename | Prevents fallback to `claude-sonnet-4-5-*` |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | model filename | Prevents fallback to `claude-opus-4-5-*` |
+| `DISABLE_TELEMETRY` | `1` | Stops background calls to `api.anthropic.com` |
+
+> **Root cause of "model may not exist" error:** Claude Code uses three model tiers internally
+> (Haiku / Sonnet / Opus). Without all three `ANTHROPIC_DEFAULT_*` vars set, background tasks
+> fall back to Anthropic's model names which the local server doesn't recognize → 404 → error.
+
+**llama-server flags required:** `--jinja` for correct Gemma 4 chat template handling.
+
+### Anthropic Python SDK
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(
+    api_key="local",
+    base_url="http://127.0.0.1:10222",
+)
+
+msg = client.messages.create(
+    model="gemma-4-E2B-it-Q4_K_M.gguf",
+    max_tokens=131072,   # use full slot budget; model stops when done
+    messages=[{"role": "user", "content": "your prompt here"}],
+)
+
+for block in msg.content:
+    if block.type == "thinking":
+        print("Thinking:", block.thinking[:200])
+    elif block.type == "text":
+        print("Answer:", block.text)
+```
+
+**Important:** `max_tokens` covers thinking + output combined. Use ≥ 4096 or the full
+131072 — if too small (e.g. 1024), reasoning exhausts the budget and `text` blocks are empty.
+
+Tool calling works via `tools=` parameter. Install SDK: `pip install anthropic` (use `.venv/`).
 
 ---
 
@@ -165,12 +251,30 @@ Benchmark results go in `results/`. Server logs go in `logs/`.
 - Port: **10333**
 
 ### Gemma 4 E2B (llama.cpp) — fastest / lowest VRAM
-- **~160 tok/s** single-request — 4× faster than Qwen3.5-27B at single-request
+- **Q4_K_M: 136 tok/s** single (server), **211 tok/s** raw (llama-bench) — 4× faster than Qwen3.5-27B
+- **F16: 93 tok/s** single (server), **108 tok/s** raw — use Q4_K_M instead (see below)
 - **iSWA architecture**: sliding window bounded at 1024 tokens (most layers), only 3 full-attention layers → KV cache barely scales with context
 - 131K native context; single-slot max is **2M tokens** (21.7 GB VRAM)
-- Max parallel at 131K/slot: **p=40** on 24 GB — VRAM plateaus ~24 GB from p=28 onward (each extra slot only pays for 1024-token SWA window, not full 131K)
-- `reasoning_content` field for thinking (same as DeepSeek format); needs `max_tokens ≥ 1024`
+- Max parallel at 131K/slot: **p=40** on 24 GB — VRAM plateaus ~24 GB from p=28 onward
+- **p=20 at 131K/slot = 19.3 GB VRAM** — recommended sweet spot; 394 tok/s aggregate peak at n=16
+- TTFT: ~60ms single-user, ~209ms at n=16 concurrency
+- Anthropic SDK: `ThinkingBlock` + `TextBlock` in `msg.content`; use `max_tokens ≥ 4096`
+- **SSE note**: thinking tokens stream as `delta.reasoning_content`, not `delta.content` — benchmarks must count both
+- **Tool calling works** (single tool per turn); no multi-tool chaining in one response
 - **Build requirement**: upstream llama.cpp ≥ ggml v0.9.11 (`gemma4` arch added ~April 2026)
+
+#### F16 vs Q4_K_M (E2B)
+Q4_K_M wins on every practical metric — do not use F16 for inference:
+
+| | Q4_K_M | F16 |
+|---|---|---|
+| Size | 2.88 GiB | 8.66 GiB |
+| Single tok/s | **136** | 93 |
+| PP tok/s (llama-bench) | **14,115** | 2,838 |
+| Max practical slots @ 131K | **20** (4.3 GB free) | 14 (2.6 GB free) |
+| Peak agg tok/s | **394** | 383 |
+
+F16 at 18 slots fills VRAM to 97% (97 MiB free) — CUDA compute buffers starve → requests take 48s. Must leave ≥2 GB free. Max practical is p=14.
 
 ### Qwen3.5-27B (llama.cpp, tq3_0 KV cache)
 - **~40 tok/s** single-request, **113 tok/s** peak at n=8
