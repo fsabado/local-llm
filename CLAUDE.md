@@ -10,7 +10,8 @@ Personal workspace for running, benchmarking, and optimizing LLMs locally on an 
 | OS | Ubuntu on WSL2 (Linux 6.6) |
 | CUDA | 13.0 (`/usr/local/cuda`) |
 | Inference (Qwen) | llama-turboquant-animehacker (`~/src/llama-turboquant-animehacker/build-cuda/bin`) |
-| Inference (Gemma 4) | upstream llama.cpp (`~/src/llama.cpp-upstream/build-cuda/bin`) |
+| Inference (Gemma 4 f16 KV) | upstream llama.cpp (`~/src/llama.cpp-upstream/build-cuda/bin`) |
+| Inference (Gemma 4 turbo4 KV) | llama-cpp-turboquant-gemma4 (`~/src/llama-cpp-turboquant-gemma4/build-cuda/bin`) |
 | Inference (vLLM) | `.venv/` — shared Python env, activate with `source .venv/bin/activate` |
 
 > **WSL2 note:** loopback (`127.0.0.1`) TCP is blocked inside the Claude Code sandbox.
@@ -107,13 +108,14 @@ bash start.sh /home/fsabado/models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf 102
 ### Gemma 4 26B A4B (highest quality, MoE 25B/4B active, port 10444)
 
 ```bash
-# Default: 4 parallel at 32K/slot — 188 tok/s peak (~22 GB VRAM)
-cd gemma4-26b-a4b && bash start.sh
+# turbo4 KV: 4 users at full 262K native context (only possible with turbo4)
+cd gemma4-26b-a4b && bash start.sh --turbo4
 
-# Single-user, small ctx — max speed (~90 tok/s, ~21 GB VRAM)
-bash start.sh /home/fsabado/models/gemma-4-26b-a4b-it/google_gemma-4-26B-A4B-it-Q4_K_M.gguf 10444 4096 1
+# turbo4 KV: 16 users at 131K/slot (~24 GB, best throughput)
+bash start.sh --turbo4 /path/to/model.gguf 10444 $((131072*16)) 16
 
-# ⚠️  DO NOT use ctx*parallel > 131072 — causes 7× slowdown
+# f16 KV: 4 users at 32K/slot (simpler, no turbo4 build needed)
+bash start.sh
 ```
 
 ### Qwen3.5-27B Q4_K_M via llama.cpp (best quality, tq3_0 KV cache)
@@ -152,10 +154,9 @@ Benchmark results go in `results/`. Server logs go in `logs/`.
 
 ### Gemma 4 26B A4B (llama.cpp) — highest quality
 - **MoE:** 25.23B total, ~4B active per token — generation speed close to dense 4B model
-- **~83 tok/s** single-request, **~188 tok/s** peak aggregate at p=4
-- **Context cliff:** ctx×parallel > 131K causes **>7× slowdown** (full-attention layer KV scaling)
-- Best config: `--ctx-size 131072 --parallel 4` (32K/slot, ~22 GB VRAM)
-- Parallelism ceiling: **p=4** at 131K/slot — model base consumes 20.5 GB, leaving only ~4 GB for KV
+- **f16 KV:** ~83 tok/s single, p=4 ceiling (20.5 GB base leaves only ~4 GB for KV); ctx cliff at 131K total
+- **turbo4 KV** (`llama-cpp-turboquant-gemma4`): ~114 tok/s, **p=50+ ceiling** (iSWA plateau), 4 users at native 262K context
+- turbo4 saves 3.8 GB KV at 256K context — unlocks full native context for multi-user
 - Port: **10444**
 
 ### Gemma 4 E4B (llama.cpp) — balanced
@@ -186,13 +187,21 @@ Benchmark results go in `results/`. Server logs go in `logs/`.
 
 ## Build References
 
-### upstream llama.cpp (required for Gemma 4)
+### upstream llama.cpp (Gemma 4, f16 KV)
 ```bash
 cd ~/src/llama.cpp-upstream
-mkdir -p build-cuda && cd build-cuda
-cmake .. -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
-cmake --build . --target llama-server llama-bench -j$(nproc)
+cmake --build build-cuda --target llama-server llama-bench -j$(nproc)
+```
+
+### llama-cpp-turboquant-gemma4 (Gemma 4 + turbo4 KV, recommended)
+```bash
+cd ~/src/llama-cpp-turboquant-gemma4  # git clone test1111111111111112/llama-cpp-turboquant-gemma4
+cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+cmake --build build-cuda --target llama-server llama-bench -j$(nproc)
+# ~90s build time
 ```
 
 ### llama-turboquant-animehacker (Qwen3.5-27B tq3_0)

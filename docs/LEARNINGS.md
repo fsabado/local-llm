@@ -765,7 +765,8 @@ export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
 
 **Model:** `bartowski/google_gemma-4-26B-A4B-it-GGUF` Q4_K_M  
 **File:** 15.85 GiB | 25.23B total params, ~4B active per token  
-**Binary:** `llama.cpp-upstream` (build b32-66c4f9ded)
+**Binary (f16 KV):** `llama.cpp-upstream` (build b32-66c4f9ded)  
+**Binary (turbo4 KV):** `llama-cpp-turboquant-gemma4` (build e93b7c5) — see section below
 
 ### Architecture
 
@@ -780,30 +781,35 @@ The MoE sparsity means token generation speed is close to a dense 4B model (~100
 despite 25B total parameters. The iSWA pattern limits KV scaling — SWA layers only store
 1024 tokens, full-attention layers use 2 KV heads (very small GQA).
 
-### VRAM Breakdown (Q4_K_M, 24 GB card)
+### VRAM Breakdown (Q4_K_M, 24 GB card) — f16 KV vs turbo4 KV
 
-| Config | VRAM | Notes |
-|--------|------|-------|
-| Model only (ctx=8K, p=1) | 20,539 MiB | ~20 GB base — tight headroom |
-| +ctx=131K, p=1 | 22,924 MiB | +2,385 MiB KV |
-| +ctx=262K, p=1 | 23,830 MiB | sub-linear due to iSWA |
-| ctx=524K, p=4 (131K/slot) | 23,669 MiB | ✅ max useful config |
-| ctx=786K, p=6 | OOM | ❌ |
-| ctx=1M, p=8 | OOM | ❌ |
+| Config | f16 KV VRAM | turbo4 KV VRAM | Notes |
+|--------|-------------|----------------|-------|
+| Model only (ctx=8K, p=1) | 20,539 MiB | — | ~20 GB base |
+| ctx=131K, p=1 | 22,924 MiB | — | +2,385 MiB KV |
+| ctx=262K, p=1 | 23,830 MiB | **20,090 MiB** | turbo4 saves 3,834 MiB (3.8×) |
+| ctx=262K, p=2 | ~OOM | **21,550 MiB** | turbo4 enables p=2 at native ctx |
+| ctx=262K, p=4 | OOM | **23,895 MiB** | ✅ turbo4 enables p=4 at native ctx |
+| ctx=131K, p=4 | 23,669 MiB | ~22 GiB | ✅ |
+| ctx=131K, p=6 | OOM | ~22 GiB | ✅ turbo4 unlocks |
+| ctx=131K, p=8 | OOM | 23,880 MiB | ✅ turbo4 unlocks |
+| ctx=131K, p=50 | OOM | 23,960 MiB | ✅ turbo4+iSWA plateau |
 
-**Parallelism ceiling: p=4 at 131K/slot on 24 GB.** This is much lower than E2B (p=40) and
-E4B (p=8) due to the large model base (20.5 GB vs 2.9 GB / 5.0 GB).
+**f16 ceiling: p=4 at 131K/slot.**  
+**turbo4 ceiling: p=50+ at 131K/slot** (VRAM plateaus at ~24 GB due to iSWA — SWA layers only store
+1024 tokens/slot, full-attn layers compressed 3.8× by turbo4). Exact OOM not yet found.
 
 ### Raw Throughput (llama-bench, flash-attn, -ngl 99)
 
-| Test | tok/s |
-|------|-------|
-| pp512 | 1,977 |
-| pp2048 | 4,404 |
-| tg128 | 99.5 |
-| tg256 | 117.1 |
+| Test | f16 KV (upstream) | turbo4 KV (tq-gemma4) |
+|------|-------------------|----------------------|
+| pp512 | 1,977 tok/s | 2,397 tok/s (+21%) |
+| pp2048 | 4,404 tok/s | — |
+| tg128 | 99.5 tok/s | 114.1 tok/s (+15%) |
+| tg256 | 117.1 tok/s | — |
 
-MoE advantage: tg speed matches a dense ~4B model despite 25B total parameters.
+> Note: upstream vs turbo4 builds differ slightly in base optimizations; pp/tg gains partly reflect
+> build improvements, not just KV type. MoE advantage: tg speed matches a dense ~4B model despite 25B params.
 
 ### API Throughput — Context Sweet Spot
 
@@ -838,6 +844,7 @@ CUDA compute cost dominates even for short inputs.
 
 ### Recommended Configs
 
+**f16 KV (upstream llama.cpp):**
 ```bash
 LLAMA_BIN="/home/fsabado/src/llama.cpp-upstream/build-cuda/bin"
 MODEL="/home/fsabado/models/gemma-4-26b-a4b-it/google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
@@ -848,32 +855,110 @@ export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
   -ngl 99 --ctx-size 131072 --parallel 4 \
   --cont-batching --flash-attn on --no-warmup --log-disable
 # VRAM: ~22 GB | Single: ~83 tok/s | agg c=4: ~188 tok/s
+# ❌ AVOID ctx*parallel > 131072 — causes 7× slowdown
+```
 
-# Single-user, short context — max speed
+**turbo4 KV (llama-cpp-turboquant-gemma4) — recommended:**
+```bash
+LLAMA_BIN="/home/fsabado/src/llama-cpp-turboquant-gemma4/build-cuda/bin"
+MODEL="/home/fsabado/models/gemma-4-26b-a4b-it/google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
+export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
+
+# Full native context, 4 users — only possible with turbo4
 "$LLAMA_BIN/llama-server" --model "$MODEL" --port 10444 --host 0.0.0.0 \
-  -ngl 99 --ctx-size 4096 --parallel 1 \
+  -ngl 99 --ctx-size 1048576 --parallel 4 \
+  --cache-type-k turbo4 --cache-type-v turbo4 \
   --cont-batching --flash-attn on --no-warmup --log-disable
-# VRAM: ~21 GB | Single: ~90 tok/s
+# VRAM: 23,895 MiB | 256K ctx/slot | tg ~114 tok/s
 
-# ❌ AVOID: any config with ctx*parallel > 131072 causes 7x slowdown
+# High parallelism at 131K/slot — turbo4 plateau unlocks 50+ slots
+"$LLAMA_BIN/llama-server" --model "$MODEL" --port 10444 --host 0.0.0.0 \
+  -ngl 99 --ctx-size $((131072*16)) --parallel 16 \
+  --cache-type-k turbo4 --cache-type-v turbo4 \
+  --cont-batching --flash-attn on --no-warmup --log-disable
+# VRAM: 23,958 MiB | 131K ctx/slot | 16 concurrent users
 ```
 
 ### Gemma 4 26B A4B vs Smaller Gemma 4 Models
 
-| Metric | E2B (4.65B) | E4B (7.52B) | 26B A4B (25.23B) |
-|--------|-------------|-------------|------------------|
-| Model VRAM | 2.9 GB | 5.0 GB | **20.5 GB** |
-| KV headroom (24 GB) | ~21 GB | ~19 GB | **~4 GB** |
-| Parallelism ceiling (131K/slot) | p=40 | p=8 | **p=4** |
-| Max safe total ctx | 2M+ | 1M | **131K** |
-| Single tok/s | ~155 | ~103 | **~83** |
-| Peak agg tok/s | ~492 (p=48) | ~467 (p=64) | **~188 (p=4)** |
-| Active params per token | 4.65B (dense) | 7.52B (dense) | **~4B (MoE)** |
-| Reasoning quality | Good | Better | **Best** |
+| Metric | E2B (4.65B) | E4B (7.52B) | 26B A4B f16 | 26B A4B turbo4 |
+|--------|-------------|-------------|-------------|----------------|
+| Model VRAM | 2.9 GB | 5.0 GB | **20.5 GB** | **20.5 GB** |
+| KV headroom (24 GB) | ~21 GB | ~19 GB | ~4 GB | **~4 GB (3.8× compressed)** |
+| Parallelism ceiling (131K/slot) | p=40 | p=8 | p=4 | **p=50+ (plateau, OOM not found)** |
+| Max ctx/slot on 24 GB | 2M (native) | 131K | 131K | **262K (native max)** |
+| Single tg tok/s | ~155 | ~103 | ~83 | **~114** |
+| Peak agg tok/s | ~492 (p=48) | ~467 (p=64) | ~188 (p=4) | **TBD** |
+| Active params per token | 4.65B (dense) | 7.52B (dense) | ~4B (MoE) | **~4B (MoE)** |
+| Reasoning quality | Good | Better | Best | **Best** |
 
 **When to prefer 26B A4B:** When answer quality matters most and you can accept lower
 throughput and strictly limited parallelism. The 26B total parameter model provides
 richer context representations despite similar active-parameter cost per token.
+
+---
+
+## TurboQuant KV Cache for Gemma 4 — `llama-cpp-turboquant-gemma4`
+
+**Repo:** `test1111111111111112/llama-cpp-turboquant-gemma4`  
+**Built:** `~/src/llama-cpp-turboquant-gemma4/build-cuda/bin` (SM89, CUDA 13)  
+**Based on:** `animehacker/llama-turboquant` + Gemma 4 D=256/512 head support
+
+### What It Is
+
+Upstream llama.cpp's `animehacker/llama-turboquant` fork supports turbo4 KV cache (3.8× compression
+vs f16) but only for head_dim=128. Gemma 4 uses mixed head dims: SWA layers use D=256, full-attention
+layers use D=512. This fork extends the turbo4 flash-attention CUDA kernels to support D=256/512
+via six optimizations:
+
+| Optimization | Speed gain |
+|---|---|
+| Baseline D=256/512 turbo4 | 53% of f16 |
+| + Lazy V (defer inverse WHT to post-loop) | +7% |
+| + Lazy K (pre-transform Q once) | +7% |
+| + Batch centroid decode (uint32/64 loads) | +13% |
+| + Optimized write path (unrolled WHT + batch 3-bit packing) | +7% |
+| + Warp-cooperative write (16-thread shuffle WHT) | +13% → **100% of f16** |
+
+### Build
+
+```bash
+cd ~/src/llama-cpp-turboquant-gemma4
+cmake -B build-cuda -S . -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+cmake --build build-cuda --target llama-server llama-bench -j$(nproc)
+# Takes ~90s on RTX 4090 / 16 core
+```
+
+### Performance vs f16 KV (RTX 4090, Gemma 4 26B A4B Q4_K_M)
+
+| KV type | pp512 | tg128 | 256K ctx VRAM (p=1) | Max seqs @ 131K/slot |
+|---------|-------|-------|---------------------|----------------------|
+| f16 | 2,322 tok/s | 124.8 tok/s | 23,924 MiB | 4 |
+| turbo4 | 2,397 tok/s | 114.1 tok/s | **20,090 MiB** | **50+ (plateau)** |
+
+- **tg128:** turbo4 is ~8% slower than f16 (114 vs 124 tok/s) — minor tradeoff
+- **VRAM at 256K:** saves 3,834 MiB vs f16 — enables p=4 at full native context
+- **Parallelism:** f16 ceiling was p=4 at 131K/slot; turbo4 plateaus at ~24 GB for all p≥8
+  (iSWA + turbo4 compression = SWA slots nearly free, full-attn slots 3.8× cheaper)
+
+### VRAM at Full Native Context (262K/slot)
+
+| Config | VRAM | Status |
+|--------|------|--------|
+| f16, ctx=262K, p=1 | 23,924 MiB | ✅ barely fits |
+| f16, ctx=262K, p=2 | ~OOM | ❌ |
+| **turbo4, ctx=262K, p=1** | **20,090 MiB** | ✅ 3.8 GB saved |
+| **turbo4, ctx=262K, p=2** | **21,550 MiB** | ✅ |
+| **turbo4, ctx=262K, p=4** | **23,895 MiB** | ✅ 4 users at native max ctx |
+
+### Status
+
+- ✅ Correctness verified (17×23 math, reasoning quality)
+- ⚠️ Single repo commit (April 4, 2026) — no git history, likely a one-shot upload
+- ⚠️ API throughput at high parallelism not yet benchmarked (pending)
+- ❌ Upstream PR #21131 (full turbo4) was closed April 2026; CPU-only PR #21089 still open
+- No official upstream merge path yet
 
 ---
 
@@ -899,8 +984,10 @@ richer context representations despite similar active-parameter cost per token.
 | **Gemma 4 E4B Q4_K_M p=4 524K** | **~103** | **~236 (n=4)** | **131072/slot** | **4** | Best E4B context quality |
 | **Gemma 4 E4B Q4_K_M p=8 1M** | **~103** | **~446 (n=32)** | **131072/slot** | **8** | E4B full-ctx ceiling on 24GB |
 | Gemma 4 E4B Q4_K_M p=64 131K | ~84 | ~467 (n=64) | 2048/slot | 64 | E4B high concurrency |
-| **Gemma 4 26B A4B Q4_K_M p=4 131K** | **~83** | **~188 (n=4)** | **32768/slot** | **4** | **Best quality; MoE 25B total / 4B active** |
-| Gemma 4 26B A4B Q4_K_M p=1 4K | ~90 | ~90 | 4096/slot | 1 | Single-user max speed |
+| **Gemma 4 26B A4B Q4_K_M p=4 131K** | **~83** | **~188 (n=4)** | **32768/slot** | **4** | Best quality, f16 KV |
+| Gemma 4 26B A4B Q4_K_M p=1 4K | ~90 | ~90 | 4096/slot | 1 | Single-user max speed, f16 |
+| **26B A4B turbo4 p=4 262K/slot** | **~114** | **TBD** | **262144/slot** | **4** | **turbo4; full native ctx; 23.9 GB** |
+| **26B A4B turbo4 p=16 131K/slot** | **~114** | **TBD** | **131072/slot** | **16** | **turbo4; 4× more users than f16** |
 
 ### Key Insights
 
