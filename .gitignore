@@ -1,0 +1,26 @@
+# Model files
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Virtual environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# HuggingFace cache
+.cache/
+
+# Logs and temp output
+logs/*.log
+*.log
+
+# Benchmark results (keep .gitkeep, ignore actual output files)
+results/*
+!results/.gitkeep
+
+# Claude Code local settings
+.claude/settings.local.json

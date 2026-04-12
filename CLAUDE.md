@@ -1,0 +1,165 @@
+# local-llm
+
+Personal workspace for running, benchmarking, and optimizing LLMs locally on an RTX 4090 (24 GB VRAM, WSL2).
+
+## Hardware & Stack
+
+| Item | Value |
+|------|-------|
+| GPU | NVIDIA RTX 4090, 24 GB VRAM |
+| OS | Ubuntu on WSL2 (Linux 6.6) |
+| CUDA | 13.0 (`/usr/local/cuda`) |
+| Inference (Qwen) | llama-turboquant-animehacker (`~/src/llama-turboquant-animehacker/build-cuda/bin`) |
+| Inference (Gemma 4) | upstream llama.cpp (`~/src/llama.cpp-upstream/build-cuda/bin`) |
+| Inference (vLLM) | `.venv/` — shared Python env, activate with `source .venv/bin/activate` |
+
+> **WSL2 note:** loopback (`127.0.0.1`) TCP is blocked inside the Claude Code sandbox.
+> Always use the WSL2 bridge IP `172.18.0.1` when connecting to local servers.
+
+---
+
+## Directory Layout
+
+```
+local-llm/
+├── CLAUDE.md                   ← you are here
+│
+├── docs/
+│   └── LEARNINGS.md            ← experiment log: configs, results, key insights
+│
+├── scripts/
+│   ├── bench.py                ← API-level benchmark (TPS, parallel, reasoning quality)
+│   ├── run_bench.py            ← automated: start llama-server → bench → kill server
+│   ├── test.py                 ← quick smoke test for any running vLLM/llama.cpp server
+│   ├── setup.sh                ← one-time vLLM venv setup (CUDA 13, nightly)
+│   └── lm_eval_tasks/
+│       └── arc_challenge_gen.yaml  ← custom lm-eval task (ARC-Challenge, generate_until)
+│
+├── results/                    ← benchmark output files (gitignored)
+├── logs/                       ← server log files (gitignored)
+│
+├── gemma4-e2b/
+│   └── start.sh                ← Gemma 4 E2B Q4_K_M via upstream llama.cpp, port 10222
+│
+├── gemma4-e4b/
+│   └── start.sh                ← Gemma 4 E4B via vLLM, port 8001
+│
+├── qwen35-27b/
+│   └── start.sh                ← Qwen3.5-27B AWQ via vLLM, port 10111
+│
+└── qwen35-27b-gguf/
+    ├── start.sh                ← Qwen3.5-27B Q4_K_M via llama-turboquant-animehacker, port 10111
+    ├── chat_template.jinja     ← thinking enabled (injects <think> in generation prompt)
+    └── chat_template_nothink.jinja  ← thinking disabled
+```
+
+---
+
+## Models
+
+| Model | Dir | Backend | Port | VRAM | Single tok/s |
+|-------|-----|---------|------|------|-------------|
+| Qwen3.5-27B AWQ (vLLM) | `qwen35-27b/` | vLLM | 10111 | ~20 GB | 14 |
+| Qwen3.5-27B Q4_K_M (llama.cpp) | `qwen35-27b-gguf/` | llama-turboquant-animehacker | 10111 | ~15 GB | 40 |
+| Gemma 4 E4B (vLLM) | `gemma4-e4b/` | vLLM | 8001 | ~8 GB | — |
+| Gemma 4 E2B Q4_K_M (llama.cpp) | `gemma4-e2b/` | upstream llama.cpp | 10222 | ~3–18 GB | 155–167 |
+
+> Only one model at a time on a single 24 GB GPU (except Gemma 4 E2B, which leaves >15 GB free).
+
+---
+
+## Quick Start
+
+### Gemma 4 E2B (recommended — fast, low VRAM, 131K context)
+
+```bash
+# Default: 16 parallel slots, 131K context per slot (~18 GB VRAM)
+cd gemma4-e2b && bash start.sh
+
+# Single-user max context (4 slots, 131K per slot, ~8.6 GB VRAM)
+bash start.sh /home/fsabado/models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf 10222 524288 4
+
+# High concurrency (64 slots, 2K per slot, ~7 GB VRAM)
+bash start.sh /home/fsabado/models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf 10222 131072 64
+```
+
+### Qwen3.5-27B Q4_K_M via llama.cpp (best quality, tq3_0 KV cache)
+
+```bash
+cd qwen35-27b-gguf && bash start.sh
+```
+
+### Qwen3.5-27B via vLLM (tool-call parser, reasoning parser)
+
+```bash
+source .venv/bin/activate
+cd qwen35-27b && bash start.sh
+```
+
+---
+
+## Benchmarking
+
+```bash
+# Smoke test — check a running server (pass port as arg)
+python3 scripts/test.py 10222
+
+# Full API benchmark (TPS, parallel throughput, reasoning quality)
+python3 scripts/bench.py 10222
+
+# Automated: start server → benchmark → kill (Qwen3.5-27B GGUF variants)
+python3 scripts/run_bench.py [model_filename.gguf]
+```
+
+Benchmark results go in `results/`. Server logs go in `logs/`.
+
+---
+
+## Key Findings (see docs/LEARNINGS.md for full detail)
+
+### Gemma 4 E2B (llama.cpp)
+- **~160 tok/s** single-request — 4× faster than Qwen3.5-27B at single-request
+- **iSWA architecture**: sliding window bounded at 1024 tokens (most layers), only 3 full-attention layers → KV cache barely scales with context
+- 131K native context, ~768 MiB per slot incremental cost at full context
+- Max parallel at full 131K per slot: **p=24** (~22.5 GB VRAM)
+- `reasoning_content` field for thinking (same as DeepSeek format); needs `max_tokens ≥ 1024`
+- **Build requirement**: upstream llama.cpp ≥ ggml v0.9.11 (`gemma4` arch added ~April 2026)
+
+### Qwen3.5-27B (llama.cpp, tq3_0 KV cache)
+- **~40 tok/s** single-request, **113 tok/s** peak at n=8
+- tq3_0 KV compression (4.57×) → up to 65K context per slot on 24 GB
+- GDN recurrent state = 149.6 MiB/slot → **p=32 is the ceiling**
+- Use llama-turboquant-animehacker build (vLLM is 3× slower due to `--enforce-eager` + AWQ+GDN conflict)
+
+### Qwen3.5-27B (vLLM)
+- `--enforce-eager` mandatory for AWQ + GDN hybrid layers — CUDA graphs cause OOM or are 3× slower
+- FP8 KV cache (`--kv-cache-dtype fp8`) doubles context to ~8K, 100s warmup on first request
+- Best multi-user vLLM config: FP8 + p=8 + 7840 ctx
+
+---
+
+## Build References
+
+### upstream llama.cpp (required for Gemma 4)
+```bash
+cd ~/src/llama.cpp-upstream
+mkdir -p build-cuda && cd build-cuda
+cmake .. -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+cmake --build . --target llama-server llama-bench -j$(nproc)
+```
+
+### llama-turboquant-animehacker (Qwen3.5-27B tq3_0)
+```bash
+cd ~/src/llama-turboquant-animehacker
+mkdir -p build-cuda && cd build-cuda
+cmake .. -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+cmake --build . -j$(nproc)
+```
+
+### vLLM environment
+```bash
+bash scripts/setup.sh   # run once from repo root
+source .venv/bin/activate
+```
