@@ -565,14 +565,30 @@ API single-request decode: **~155–167 tok/s** (overhead vs raw tg128 is minima
 
 **High-context configs (131K per slot):**
 
-| Config | ctx total | Per slot | VRAM |
-|--------|-----------|----------|------|
-| p=4, 524K | 524288 | 131072 | 8570 MiB |
-| p=16, 2M | 2097152 | 131072 | 17930 MiB |
-| p=24, 3M *(est.)* | 3145728 | 131072 | ~22.5 GiB |
-| p=28, 3.7M *(est.)* | 3670016 | 131072 | ~26 GiB ❌ OOM |
+| Config | ctx total | Per slot | VRAM | Status |
+|--------|-----------|----------|------|--------|
+| p=4, 524K | 524288 | 131072 | 8,570 MiB | ✅ |
+| p=16, 2M | 2097152 | 131072 | 17,930 MiB | ✅ |
+| p=24, 3.1M | 3145728 | 131072 | 22,469 MiB | ✅ |
+| p=28, 3.7M | 3670016 | 131072 | 24,061 MiB | ✅ |
+| p=32, 4.2M | 4194304 | 131072 | 23,967 MiB | ✅ |
+| p=36, 4.7M | 4718592 | 131072 | 23,986 MiB | ✅ |
+| p=40, 5.2M | 5242880 | 131072 | 23,942 MiB | ✅ **ceiling** |
+| p=48, 6.3M | 6291456 | 131072 | — | ❌ OOM |
 
-**Max parallel at native 131K per-slot context on 24GB: p=24**
+**Max parallel at native 131K per-slot context on 24GB: p=40** (not p=24 as previously documented)
+
+The VRAM plateaus at ~24 GB from p=28 onward — this is the iSWA effect in action. Each additional
+slot above the initial full-attention KV budget only pays for its **1024-token SWA window**, not the
+full 131K context. So p=28 through p=40 all fit within ~24 GB even though naive math suggests they
+shouldn't.
+
+**Single-slot max context (p=1):**
+
+| ctx | VRAM |
+|-----|------|
+| 1M | 12,494 MiB |
+| 2M (native max) | 21,721 MiB |
 
 ---
 
@@ -595,7 +611,7 @@ Bat-and-ball test (requires `max_tokens=1024` — model uses `reasoning_content`
 | Single tok/s | 39.7 | **~160** (+303%) |
 | Peak total tok/s | 113 @ n=8 | **~492 @ n=48** (+335%) |
 | Max context / slot | 65K (tq3_0) | **131K** (native) |
-| Max concurrent (24GB) | 32 (2K/slot, tq3_0) | **64+ (2K/slot) / 24 (131K/slot)** |
+| Max concurrent (24GB) | 32 (2K/slot, tq3_0) | **64+ (2K/slot) / 40 (131K/slot)** |
 | Reasoning field | `reasoning_content` | `reasoning_content` |
 | Build required | turboquant-animehacker | upstream llama.cpp ≥ ggml v0.9.11 |
 
@@ -620,11 +636,17 @@ export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
   --cont-batching --flash-attn on --no-warmup
 # VRAM: 8570 MiB | Single: ~155 tok/s | 131K ctx/slot
 
-# Multi-user / full context — 16 users at native 131K context
+# Max full-context multi-user — 40 users at native 131K context (iSWA ceiling on 24GB)
 "$LLAMA_BIN/llama-server" --model "$MODEL" --port 10222 --host 0.0.0.0 \
-  -ngl 99 --ctx-size 2097152 --parallel 16 \
+  -ngl 99 --ctx-size 5242880 --parallel 40 \
   --cont-batching --flash-attn on --no-warmup
-# VRAM: 17930 MiB | Peak: ~487 tok/s @ n=16 | 131K ctx/slot
+# VRAM: 23942 MiB | 131K ctx/slot | iSWA plateau: p=28–40 all ~24 GB
+
+# Single-user / max context — full 2M native context, 1 session
+"$LLAMA_BIN/llama-server" --model "$MODEL" --port 10222 --host 0.0.0.0 \
+  -ngl 99 --ctx-size 2097152 --parallel 1 \
+  --cont-batching --flash-attn on --no-warmup
+# VRAM: 21721 MiB | 2M ctx/slot (native max)
 
 # High-concurrency / short context — 64 users at 2K context
 "$LLAMA_BIN/llama-server" --model "$MODEL" --port 10222 --host 0.0.0.0 \
@@ -769,7 +791,7 @@ despite 25B total parameters. The iSWA pattern limits KV scaling — SWA layers 
 | ctx=786K, p=6 | OOM | ❌ |
 | ctx=1M, p=8 | OOM | ❌ |
 
-**Parallelism ceiling: p=4 at 131K/slot on 24 GB.** This is much lower than E2B (p=24) and
+**Parallelism ceiling: p=4 at 131K/slot on 24 GB.** This is much lower than E2B (p=40) and
 E4B (p=8) due to the large model base (20.5 GB vs 2.9 GB / 5.0 GB).
 
 ### Raw Throughput (llama-bench, flash-attn, -ngl 99)
@@ -842,7 +864,7 @@ export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
 |--------|-------------|-------------|------------------|
 | Model VRAM | 2.9 GB | 5.0 GB | **20.5 GB** |
 | KV headroom (24 GB) | ~21 GB | ~19 GB | **~4 GB** |
-| Parallelism ceiling (131K/slot) | p=24 | p=8 | **p=4** |
+| Parallelism ceiling (131K/slot) | p=40 | p=8 | **p=4** |
 | Max safe total ctx | 2M+ | 1M | **131K** |
 | Single tok/s | ~155 | ~103 | **~83** |
 | Peak agg tok/s | ~492 (p=48) | ~467 (p=64) | **~188 (p=4)** |
@@ -870,8 +892,9 @@ richer context representations despite similar active-parameter cost per token.
 | llama.cpp tq3_0 / 65K p=32 | 20.9 | 56.7 | 2048/slot | **32** | Max parallelism |
 | llama.cpp Q3_K_M i1 / 65K p=4 | 21.8 | 23.4 (n=4) | 16384/slot | 4 | ❌ no batching; ❌ quality |
 | llama.cpp Q2_K i1 / 65K p=4 | 25.1 | 22.3 (n=4) | 16384/slot | 4 | ❌ no batching; ✅ quality |
-| **Gemma 4 E2B Q4_K_M p=4 524K** | **~155** | **~350 (n=4)** | **131072/slot** | **4** | **Best context quality; upstream llama.cpp** |
-| **Gemma 4 E2B Q4_K_M p=16 2M** | **~155** | **~487 (n=16)** | **131072/slot** | **16** | **Best full-ctx multi-user** |
+| **Gemma 4 E2B Q4_K_M p=4 524K** | **~155** | **~350 (n=4)** | **131072/slot** | **4** | Best context quality |
+| **Gemma 4 E2B Q4_K_M p=40 5.2M** | **~155** | **~(tbd)** | **131072/slot** | **40** | **iSWA ceiling on 24 GB** |
+| **Gemma 4 E2B Q4_K_M p=1 2M** | **~155** | **~155** | **2097152/slot** | **1** | **Max single-slot context (native)** |
 | Gemma 4 E2B Q4_K_M p=64 131K | ~150 | ~492 (n=48) | 2048/slot | 64 | Best concurrency, short ctx |
 | **Gemma 4 E4B Q4_K_M p=4 524K** | **~103** | **~236 (n=4)** | **131072/slot** | **4** | Best E4B context quality |
 | **Gemma 4 E4B Q4_K_M p=8 1M** | **~103** | **~446 (n=32)** | **131072/slot** | **8** | E4B full-ctx ceiling on 24GB |

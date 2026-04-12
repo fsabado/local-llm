@@ -94,8 +94,11 @@ bash start.sh /home/fsabado/models/gemma-4-e4b-it/google_gemma-4-E4B-it-Q4_K_M.g
 # Default: 16 parallel slots, 131K context per slot (~18 GB VRAM)
 cd gemma4-e2b && bash start.sh
 
-# Single-user max context (4 slots, 131K per slot, ~8.6 GB VRAM)
-bash start.sh /home/fsabado/models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf 10222 524288 4
+# Max full-context parallelism — 40 slots at 131K/slot (~24 GB, iSWA ceiling)
+bash start.sh /home/fsabado/models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf 10222 5242880 40
+
+# Single-user max context — full 2M native context, 1 session (~21.7 GB VRAM)
+bash start.sh /home/fsabado/models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf 10222 2097152 1
 
 # High concurrency (64 slots, 2K per slot, ~7 GB VRAM)
 bash start.sh /home/fsabado/models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf 10222 131072 64
@@ -163,8 +166,8 @@ Benchmark results go in `results/`. Server logs go in `logs/`.
 ### Gemma 4 E2B (llama.cpp) — fastest / lowest VRAM
 - **~160 tok/s** single-request — 4× faster than Qwen3.5-27B at single-request
 - **iSWA architecture**: sliding window bounded at 1024 tokens (most layers), only 3 full-attention layers → KV cache barely scales with context
-- 131K native context, ~768 MiB per slot incremental cost at full context
-- Max parallel at full 131K per slot: **p=24** (~22.5 GB VRAM)
+- 131K native context; single-slot max is **2M tokens** (21.7 GB VRAM)
+- Max parallel at 131K/slot: **p=40** on 24 GB — VRAM plateaus ~24 GB from p=28 onward (each extra slot only pays for 1024-token SWA window, not full 131K)
 - `reasoning_content` field for thinking (same as DeepSeek format); needs `max_tokens ≥ 1024`
 - **Build requirement**: upstream llama.cpp ≥ ggml v0.9.11 (`gemma4` arch added ~April 2026)
 
