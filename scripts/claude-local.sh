@@ -30,24 +30,28 @@ case "$MODEL" in
     BIN="$LLAMA_BIN_UPSTREAM"
     GGUF="$MODELS_DIR/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf"
     PORT=10222; CTX=524288; PAR=4; KV_FLAGS=""
+    MODEL_ID="gemma-4-E2B-it-Q4_K_M.gguf"
     DESC="Gemma 4 E2B Q4_K_M — 131K/slot × 4 — ~155 tok/s"
     ;;
   e4b)
     BIN="$LLAMA_BIN_UPSTREAM"
     GGUF="$MODELS_DIR/gemma-4-e4b-it/google_gemma-4-E4B-it-Q4_K_M.gguf"
     PORT=10333; CTX=524288; PAR=4; KV_FLAGS=""
+    MODEL_ID="google_gemma-4-E4B-it-Q4_K_M.gguf"
     DESC="Gemma 4 E4B Q4_K_M — 131K/slot × 4 — ~103 tok/s"
     ;;
   26b)
     BIN="$LLAMA_BIN_UPSTREAM"
     GGUF="$MODELS_DIR/gemma-4-26b-a4b-it/google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
     PORT=10444; CTX=131072; PAR=4; KV_FLAGS=""
+    MODEL_ID="google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
     DESC="Gemma 4 26B A4B Q4_K_M — 32K/slot × 4 — ~83 tok/s"
     ;;
   26b-t4)
     BIN="$LLAMA_BIN_TURBO4"
     GGUF="$MODELS_DIR/gemma-4-26b-a4b-it/google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
     PORT=10444; CTX=1048576; PAR=4; KV_FLAGS="--cache-type-k turbo4 --cache-type-v turbo4"
+    MODEL_ID="google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
     DESC="Gemma 4 26B A4B Q4_K_M — turbo4 KV — 262K/slot × 4 — ~114 tok/s"
     ;;
   *)
@@ -102,7 +106,7 @@ echo ""
 # ── Launch Claude Code against local server ───────────────────────────────────
 export ANTHROPIC_AUTH_TOKEN="local"
 export ANTHROPIC_BASE_URL="$BASE_URL"
-export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_MODEL="$MODEL_ID"
 export MAX_THINKING_TOKENS="0"
 
 exec claude "$@"
