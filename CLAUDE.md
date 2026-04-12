@@ -42,7 +42,10 @@ local-llm/
 │   └── start.sh                ← Gemma 4 E2B Q4_K_M via upstream llama.cpp, port 10222
 │
 ├── gemma4-e4b/
-│   └── start.sh                ← Gemma 4 E4B via vLLM, port 8001
+│   └── start.sh                ← Gemma 4 E4B Q4_K_M via upstream llama.cpp, port 10333
+│
+├── gemma4-26b-a4b/
+│   └── start.sh                ← Gemma 4 26B A4B Q4_K_M via upstream llama.cpp, port 10444
 │
 ├── qwen35-27b/
 │   └── start.sh                ← Qwen3.5-27B AWQ via vLLM, port 10111
@@ -64,8 +67,9 @@ local-llm/
 | Gemma 4 E4B (vLLM) | `gemma4-e4b/` | vLLM | 8001 | ~8 GB | — |
 | Gemma 4 E4B Q4_K_M (llama.cpp) | `gemma4-e4b/` | upstream llama.cpp | 10333 | ~10–23 GB | 100–105 |
 | Gemma 4 E2B Q4_K_M (llama.cpp) | `gemma4-e2b/` | upstream llama.cpp | 10222 | ~6–18 GB | 155–167 |
+| Gemma 4 26B A4B Q4_K_M (llama.cpp) | `gemma4-26b-a4b/` | upstream llama.cpp | 10444 | ~22–24 GB | 83–90 |
 
-> Only one model at a time on a single 24 GB GPU (except Gemma 4 E2B, which leaves >15 GB free).
+> Only one model at a time on a single 24 GB GPU (except Gemma 4 E2B/E4B, which leave headroom).
 
 ---
 
@@ -95,6 +99,18 @@ bash start.sh /home/fsabado/models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf 102
 
 # High concurrency (64 slots, 2K per slot, ~7 GB VRAM)
 bash start.sh /home/fsabado/models/gemma-4-e2b-it/gemma-4-E2B-it-Q4_K_M.gguf 10222 131072 64
+```
+
+### Gemma 4 26B A4B (highest quality, MoE 25B/4B active, port 10444)
+
+```bash
+# Default: 4 parallel at 32K/slot — 188 tok/s peak (~22 GB VRAM)
+cd gemma4-26b-a4b && bash start.sh
+
+# Single-user, small ctx — max speed (~90 tok/s, ~21 GB VRAM)
+bash start.sh /home/fsabado/models/gemma-4-26b-a4b-it/google_gemma-4-26B-A4B-it-Q4_K_M.gguf 10444 4096 1
+
+# ⚠️  DO NOT use ctx*parallel > 131072 — causes 7× slowdown
 ```
 
 ### Qwen3.5-27B Q4_K_M via llama.cpp (best quality, tq3_0 KV cache)
@@ -131,7 +147,20 @@ Benchmark results go in `results/`. Server logs go in `logs/`.
 
 ## Key Findings (see docs/LEARNINGS.md for full detail)
 
-### Gemma 4 E2B (llama.cpp)
+### Gemma 4 26B A4B (llama.cpp) — highest quality
+- **MoE:** 25.23B total, ~4B active per token — generation speed close to dense 4B model
+- **~83 tok/s** single-request, **~188 tok/s** peak aggregate at p=4
+- **Context cliff:** ctx×parallel > 131K causes **>7× slowdown** (full-attention layer KV scaling)
+- Best config: `--ctx-size 131072 --parallel 4` (32K/slot, ~22 GB VRAM)
+- Parallelism ceiling: **p=4** at 131K/slot — model base consumes 20.5 GB, leaving only ~4 GB for KV
+- Port: **10444**
+
+### Gemma 4 E4B (llama.cpp) — balanced
+- **~100 tok/s** single-request, ~467 tok/s peak
+- Max parallel at full 131K per slot: **p=8** (~23.4 GB VRAM)
+- Port: **10333**
+
+### Gemma 4 E2B (llama.cpp) — fastest / lowest VRAM
 - **~160 tok/s** single-request — 4× faster than Qwen3.5-27B at single-request
 - **iSWA architecture**: sliding window bounded at 1024 tokens (most layers), only 3 full-attention layers → KV cache barely scales with context
 - 131K native context, ~768 MiB per slot incremental cost at full context

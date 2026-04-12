@@ -739,6 +739,122 @@ export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
 
 ---
 
+## Gemma 4 26B A4B (effective 4B active, 25.23B total MoE) — llama.cpp
+
+**Model:** `bartowski/google_gemma-4-26B-A4B-it-GGUF` Q4_K_M  
+**File:** 15.85 GiB | 25.23B total params, ~4B active per token  
+**Binary:** `llama.cpp-upstream` (build b32-66c4f9ded)
+
+### Architecture
+
+- **30 layers**, iSWA pattern: 5 SWA layers then 1 full-attention, repeating
+  - SWA layers: 8 KV heads @ head_dim=256, window=1024 tokens
+  - Full-attention layers: 2 KV heads @ head_dim=512 (GQA ratio=8)
+- **MoE:** 128 experts, 8 active per token (`n_expert=128`, `n_expert_used=8`)
+- **Expert FFN dim:** 704 (dense FFN: 2112)
+- **Context trained:** 262,144 tokens
+
+The MoE sparsity means token generation speed is close to a dense 4B model (~100 tok/s),
+despite 25B total parameters. The iSWA pattern limits KV scaling — SWA layers only store
+1024 tokens, full-attention layers use 2 KV heads (very small GQA).
+
+### VRAM Breakdown (Q4_K_M, 24 GB card)
+
+| Config | VRAM | Notes |
+|--------|------|-------|
+| Model only (ctx=8K, p=1) | 20,539 MiB | ~20 GB base — tight headroom |
+| +ctx=131K, p=1 | 22,924 MiB | +2,385 MiB KV |
+| +ctx=262K, p=1 | 23,830 MiB | sub-linear due to iSWA |
+| ctx=524K, p=4 (131K/slot) | 23,669 MiB | ✅ max useful config |
+| ctx=786K, p=6 | OOM | ❌ |
+| ctx=1M, p=8 | OOM | ❌ |
+
+**Parallelism ceiling: p=4 at 131K/slot on 24 GB.** This is much lower than E2B (p=24) and
+E4B (p=8) due to the large model base (20.5 GB vs 2.9 GB / 5.0 GB).
+
+### Raw Throughput (llama-bench, flash-attn, -ngl 99)
+
+| Test | tok/s |
+|------|-------|
+| pp512 | 1,977 |
+| pp2048 | 4,404 |
+| tg128 | 99.5 |
+| tg256 | 117.1 |
+
+MoE advantage: tg speed matches a dense ~4B model despite 25B total parameters.
+
+### API Throughput — Context Sweet Spot
+
+**⚠️ Critical finding:** A sharp performance cliff exists above ~131K total context.
+
+| Total ctx | Per-slot | agg c=4 | Single tok/s | Notes |
+|-----------|----------|---------|--------------|-------|
+| 4,096 | 4K | — | 76 | Very fast |
+| 32,768 | 8K | 188 | 80 | ✅ Sweet spot |
+| 131,072 | 32K | 188 | 81 | ✅ Best balance |
+| 524,288 | 131K | ~13 | 10 | ❌ 7× slowdown |
+
+The cliff at ctx_total > 131K causes >7× throughput degradation. Root cause: full-attention
+layers must attend over the entire pre-allocated KV buffer; at 524K allocated tokens the
+CUDA compute cost dominates even for short inputs.
+
+### API Throughput — Parallel Scaling (ctx=131K total, p=4, 32K/slot)
+
+| Concurrency | avg tok/s | agg tok/s | avg latency |
+|-------------|-----------|-----------|-------------|
+| c=1 | 83 | 83 | 3.0s |
+| c=2 | 70 | 139 | 3.6s |
+| c=4 | 47 | 188 | 5.3s |
+| c=8 | 35 | 185 | 8.0s (queued 2 rounds) |
+
+### Reasoning Quality
+
+- Uses `reasoning_content` field (same as E2B/E4B)
+- Generates chain-of-thought thinking before final answer
+- 26B model produces more detailed reasoning (1,448 char thinking for "17 × 23")
+- `max_tokens ≥ 600` recommended for reasoning tasks
+
+### Recommended Configs
+
+```bash
+LLAMA_BIN="/home/fsabado/src/llama.cpp-upstream/build-cuda/bin"
+MODEL="/home/fsabado/models/gemma-4-26b-a4b-it/google_gemma-4-26B-A4B-it-Q4_K_M.gguf"
+export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
+
+# Best balance: 4 users at 32K context each — 188 tok/s peak
+"$LLAMA_BIN/llama-server" --model "$MODEL" --port 10444 --host 0.0.0.0 \
+  -ngl 99 --ctx-size 131072 --parallel 4 \
+  --cont-batching --flash-attn on --no-warmup --log-disable
+# VRAM: ~22 GB | Single: ~83 tok/s | agg c=4: ~188 tok/s
+
+# Single-user, short context — max speed
+"$LLAMA_BIN/llama-server" --model "$MODEL" --port 10444 --host 0.0.0.0 \
+  -ngl 99 --ctx-size 4096 --parallel 1 \
+  --cont-batching --flash-attn on --no-warmup --log-disable
+# VRAM: ~21 GB | Single: ~90 tok/s
+
+# ❌ AVOID: any config with ctx*parallel > 131072 causes 7x slowdown
+```
+
+### Gemma 4 26B A4B vs Smaller Gemma 4 Models
+
+| Metric | E2B (4.65B) | E4B (7.52B) | 26B A4B (25.23B) |
+|--------|-------------|-------------|------------------|
+| Model VRAM | 2.9 GB | 5.0 GB | **20.5 GB** |
+| KV headroom (24 GB) | ~21 GB | ~19 GB | **~4 GB** |
+| Parallelism ceiling (131K/slot) | p=24 | p=8 | **p=4** |
+| Max safe total ctx | 2M+ | 1M | **131K** |
+| Single tok/s | ~155 | ~103 | **~83** |
+| Peak agg tok/s | ~492 (p=48) | ~467 (p=64) | **~188 (p=4)** |
+| Active params per token | 4.65B (dense) | 7.52B (dense) | **~4B (MoE)** |
+| Reasoning quality | Good | Better | **Best** |
+
+**When to prefer 26B A4B:** When answer quality matters most and you can accept lower
+throughput and strictly limited parallelism. The 26B total parameter model provides
+richer context representations despite similar active-parameter cost per token.
+
+---
+
 ## Summary Table
 
 | Config | Single tok/s | Peak total tok/s | Max context | Max seqs | Notes |
@@ -760,6 +876,8 @@ export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
 | **Gemma 4 E4B Q4_K_M p=4 524K** | **~103** | **~236 (n=4)** | **131072/slot** | **4** | Best E4B context quality |
 | **Gemma 4 E4B Q4_K_M p=8 1M** | **~103** | **~446 (n=32)** | **131072/slot** | **8** | E4B full-ctx ceiling on 24GB |
 | Gemma 4 E4B Q4_K_M p=64 131K | ~84 | ~467 (n=64) | 2048/slot | 64 | E4B high concurrency |
+| **Gemma 4 26B A4B Q4_K_M p=4 131K** | **~83** | **~188 (n=4)** | **32768/slot** | **4** | **Best quality; MoE 25B total / 4B active** |
+| Gemma 4 26B A4B Q4_K_M p=1 4K | ~90 | ~90 | 4096/slot | 1 | Single-user max speed |
 
 ### Key Insights
 
