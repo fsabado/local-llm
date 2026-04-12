@@ -1,26 +1,41 @@
 #!/bin/bash
-# Gemma4 E4B (effective 4B) via vLLM — RTX 4090 (24GB)
-# Model: ~8GB VRAM BF16, 128K context, multimodal (text+image+audio)
-# Fast decode, small footprint, great for agentic/coding tasks
+# Gemma 4 E4B (effective 4B, actual 7.52B) via upstream llama.cpp
+# Model: Q4_K_M, 5.02 GiB, 131K native context (iSWA hybrid architecture)
+#
+# REQUIRES: ~/src/llama.cpp-upstream built with CUDA (gemma4 arch support)
+#
+# iSWA KV cache breakdown (per slot, f16):
+#   Non-SWA layers: ~2048 MiB per slot at 131K per-slot context
+#   SWA layers: ~40 MiB per slot (ring-buffered, bounded regardless of ctx)
+#
+# Parallelism / context tradeoffs on 24GB:
+#   parallel=4,  ctx=524288   → 131K/slot  (15615 MiB)  ← max context quality
+#   parallel=8,  ctx=1048576  → 131K/slot  (23401 MiB)  ← 8 full-context users (ceiling)
+#   parallel=32, ctx=131072   →   4K/slot  (10469 MiB)  ← balanced concurrency
+#   parallel=64, ctx=131072   →   2K/slot  (11485 MiB)  ← high concurrency (peak 467 tok/s)
 
 set -e
 
-MODEL="${1:-google/gemma-4-E4B-it}"
-PORT="${2:-8001}"
-MAX_LEN="${3:-65536}"
+LLAMA_BIN="/home/fsabado/src/llama.cpp-upstream/build-cuda/bin"
+MODEL="${1:-/home/fsabado/models/gemma-4-e4b-it/google_gemma-4-E4B-it-Q4_K_M.gguf}"
+PORT="${2:-10333}"
+CTX="${3:-1048576}"   # 1M total = 131K per slot at parallel=8
+PARALLEL="${4:-8}"
 
-echo "Starting vLLM server: $MODEL on port $PORT"
-echo "Max context: $MAX_LEN tokens"
+export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
+
+echo "Starting llama-server: $(basename $MODEL) on port $PORT"
+echo "Context: $CTX total | Parallel: $PARALLEL | Per-slot: $((CTX / PARALLEL))"
 echo ""
 
-source "$(dirname "$0")/../.venv/bin/activate"
-
-vllm serve "$MODEL" \
+"$LLAMA_BIN/llama-server" \
+  --model "$MODEL" \
   --port "$PORT" \
-  --max-model-len "$MAX_LEN" \
-  --gpu-memory-utilization 0.85 \
-  --enable-prefix-caching \
-  --reasoning-parser gemma4 \
-  --tool-call-parser gemma4 \
-  --chat-template examples/tool_chat_template_gemma4.jinja \
-  --host 0.0.0.0
+  --host 0.0.0.0 \
+  -ngl 99 \
+  --ctx-size "$CTX" \
+  --parallel "$PARALLEL" \
+  --cont-batching \
+  --flash-attn on \
+  --no-warmup \
+  --log-disable

@@ -635,6 +635,110 @@ export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
 
 ---
 
+---
+
+## Gemma 4 E4B (effective 4B, actual 7.52B) — llama.cpp
+
+**Model:** `bartowski/google_gemma-4-E4B-it-GGUF` Q4_K_M (5.02 GiB)  
+**Backend:** `~/src/llama.cpp-upstream` (same build as E2B)  
+**Architecture:** same iSWA hybrid as E2B — non-SWA + SWA KV caches
+
+---
+
+### Raw Throughput (llama-bench, flash-attn on)
+
+| Metric | E4B | E2B | Δ |
+|--------|-----|-----|---|
+| pp512 (prompt processing) | 9,869 tok/s | 15,484 tok/s | -36% |
+| tg128 (token generation) | **131.8 tok/s** | 216 tok/s | -39% |
+| API single-request | **~100–105 tok/s** | ~155–167 tok/s | -35% |
+
+---
+
+### iSWA KV Cache (E4B vs E2B)
+
+| Model | Non-SWA layers | VRAM/slot at 131K ctx | SWA layers | VRAM/slot (SWA) |
+|-------|---------------|----------------------|------------|-----------------|
+| E2B | 3 | 768 MiB | 12 | ~12 MiB |
+| **E4B** | **8** | **2048 MiB** | — | ~40 MiB |
+
+E4B has 2.67× the non-SWA KV cost per slot, which sharply limits full-context parallelism.
+
+---
+
+### API Throughput at Different Configurations
+
+| Config | Per slot | VRAM | n=1 | n=4 | n=8 | n=16 | n=32 | n=64 | Peak |
+|--------|---------|------|-----|-----|-----|------|------|------|------|
+| p=4, ctx=131K | 32768 | 9292 MiB | 92 | 236 | 202 | 214 | 198 | — | **~236 @ n=4** |
+| p=32, ctx=131K | 4096 | 10469 MiB | 96 | 204 | 254 | 421 | **446** | — | **~446 @ n=32** |
+| p=64, ctx=131K | 2048 | 11485 MiB | 84 | 217 | 267 | 308 | 433 | **467** | **~467 @ n=64** |
+
+*(tok/s = total system throughput)*
+
+### High-context configs (131K per slot)
+
+| Config | VRAM | Notes |
+|--------|------|-------|
+| p=4, ctx=524K | 15615 MiB | Max context quality |
+| **p=8, ctx=1M** | **23401 MiB** | **Ceiling — 8 full-context users** |
+| p=12+ at 131K/slot | OOM (lazy alloc masks real limit) | Use p=8 as safe ceiling |
+
+**Max parallel at native 131K per-slot context on 24GB: p=8**  
+(vs E2B's p=24 — E4B's 8 non-SWA layers cost 2.67× more KV per slot)
+
+---
+
+### Reasoning Quality
+
+- ✅ Bat-and-ball **CORRECT** — answered in **486 tokens** (vs E2B's 829 tokens)
+- E4B is more concise in reasoning traces
+- Same `reasoning_content` field; same `max_tokens ≥ 1024` requirement
+
+---
+
+### Gemma 4 E4B vs E2B vs Qwen3.5-27B (llama.cpp)
+
+| Metric | Qwen3.5-27B Q4_K_M | Gemma 4 E2B Q4_K_M | Gemma 4 E4B Q4_K_M |
+|--------|---------------------|---------------------|---------------------|
+| Model VRAM | 15.4 GB | 2.9 GB | **5.0 GB** |
+| Single tok/s | 39.7 | ~160 | **~103** |
+| Peak total tok/s | 113 @ n=8 | ~492 @ n=48 | **~467 @ n=64** |
+| Max ctx/slot | 65K (tq3_0) | 131K | **131K** |
+| Max parallel at 131K/slot | 32 | 24 | **8** |
+| Reasoning tokens used | N/A | 829 | **486 (more efficient)** |
+| KV per slot at 131K ctx | ~150 MiB | 768 MiB | **2048 MiB** |
+
+**When to prefer E4B over E2B:** When reasoning quality matters and VRAM headroom is available. E4B answers more concisely (fewer reasoning tokens). At high concurrency with short context, E4B and E2B peak throughput is similar (~460–495 tok/s).
+
+### Recommended Configs
+
+```bash
+LLAMA_BIN="/home/fsabado/src/llama.cpp-upstream/build-cuda/bin"
+MODEL="/home/fsabado/models/gemma-4-e4b-it/google_gemma-4-E4B-it-Q4_K_M.gguf"
+export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
+
+# Single-user / deep reasoning — full 131K context per session
+"$LLAMA_BIN/llama-server" --model "$MODEL" --port 10333 --host 0.0.0.0 \
+  -ngl 99 --ctx-size 524288 --parallel 4 \
+  --cont-batching --flash-attn on --no-warmup
+# VRAM: 15615 MiB | Single: ~103 tok/s | 131K ctx/slot
+
+# Multi-user — 8 users at full 131K context (ceiling on 24GB)
+"$LLAMA_BIN/llama-server" --model "$MODEL" --port 10333 --host 0.0.0.0 \
+  -ngl 99 --ctx-size 1048576 --parallel 8 \
+  --cont-batching --flash-attn on --no-warmup
+# VRAM: 23401 MiB | Peak: ~446 tok/s @ n=32 | 131K ctx/slot
+
+# High-concurrency / short context — 64 users at 2K context
+"$LLAMA_BIN/llama-server" --model "$MODEL" --port 10333 --host 0.0.0.0 \
+  -ngl 99 --ctx-size 131072 --parallel 64 \
+  --cont-batching --flash-attn on --no-warmup
+# VRAM: 11485 MiB | Peak: ~467 tok/s @ n=64 | 2K ctx/slot
+```
+
+---
+
 ## Summary Table
 
 | Config | Single tok/s | Peak total tok/s | Max context | Max seqs | Notes |
@@ -653,6 +757,9 @@ export LD_LIBRARY_PATH="$LLAMA_BIN:$LD_LIBRARY_PATH"
 | **Gemma 4 E2B Q4_K_M p=4 524K** | **~155** | **~350 (n=4)** | **131072/slot** | **4** | **Best context quality; upstream llama.cpp** |
 | **Gemma 4 E2B Q4_K_M p=16 2M** | **~155** | **~487 (n=16)** | **131072/slot** | **16** | **Best full-ctx multi-user** |
 | Gemma 4 E2B Q4_K_M p=64 131K | ~150 | ~492 (n=48) | 2048/slot | 64 | Best concurrency, short ctx |
+| **Gemma 4 E4B Q4_K_M p=4 524K** | **~103** | **~236 (n=4)** | **131072/slot** | **4** | Best E4B context quality |
+| **Gemma 4 E4B Q4_K_M p=8 1M** | **~103** | **~446 (n=32)** | **131072/slot** | **8** | E4B full-ctx ceiling on 24GB |
+| Gemma 4 E4B Q4_K_M p=64 131K | ~84 | ~467 (n=64) | 2048/slot | 64 | E4B high concurrency |
 
 ### Key Insights
 

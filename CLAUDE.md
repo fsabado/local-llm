@@ -62,7 +62,8 @@ local-llm/
 | Qwen3.5-27B AWQ (vLLM) | `qwen35-27b/` | vLLM | 10111 | ~20 GB | 14 |
 | Qwen3.5-27B Q4_K_M (llama.cpp) | `qwen35-27b-gguf/` | llama-turboquant-animehacker | 10111 | ~15 GB | 40 |
 | Gemma 4 E4B (vLLM) | `gemma4-e4b/` | vLLM | 8001 | ~8 GB | — |
-| Gemma 4 E2B Q4_K_M (llama.cpp) | `gemma4-e2b/` | upstream llama.cpp | 10222 | ~3–18 GB | 155–167 |
+| Gemma 4 E4B Q4_K_M (llama.cpp) | `gemma4-e4b/` | upstream llama.cpp | 10333 | ~10–23 GB | 100–105 |
+| Gemma 4 E2B Q4_K_M (llama.cpp) | `gemma4-e2b/` | upstream llama.cpp | 10222 | ~6–18 GB | 155–167 |
 
 > Only one model at a time on a single 24 GB GPU (except Gemma 4 E2B, which leaves >15 GB free).
 
@@ -70,7 +71,20 @@ local-llm/
 
 ## Quick Start
 
-### Gemma 4 E2B (recommended — fast, low VRAM, 131K context)
+### Gemma 4 E4B via llama.cpp (better quality, 131K context, port 10333)
+
+```bash
+# Default: 8 parallel slots, 131K context per slot (~23.4 GB VRAM — ceiling on 24GB)
+cd gemma4-e4b && bash start.sh
+
+# Single-user max context (4 slots, 131K per slot, ~15.6 GB VRAM)
+bash start.sh /home/fsabado/models/gemma-4-e4b-it/google_gemma-4-E4B-it-Q4_K_M.gguf 10333 524288 4
+
+# High concurrency (64 slots, 2K per slot, ~11.5 GB VRAM)
+bash start.sh /home/fsabado/models/gemma-4-e4b-it/google_gemma-4-E4B-it-Q4_K_M.gguf 10333 131072 64
+```
+
+### Gemma 4 E2B (fastest — 160 tok/s, low VRAM, 131K context)
 
 ```bash
 # Default: 16 parallel slots, 131K context per slot (~18 GB VRAM)
